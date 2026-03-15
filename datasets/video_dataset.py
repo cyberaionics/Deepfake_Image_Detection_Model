@@ -7,6 +7,7 @@ augmentations for training.
 
 import os
 import glob
+import csv
 import numpy as np
 from PIL import Image
 from typing import Optional
@@ -153,6 +154,71 @@ class DeepfakeDataset(Dataset):
         return self.image_paths[idx]
 
 
+class CSVDataset(Dataset):
+    """
+    Dataset for deepfake detection reading from a CSV file.
+    Expects CSV format: image_path, label
+    - label: 0 for real, 1 for fake
+    """
+
+    def __init__(
+        self,
+        csv_path: str,
+        transform: Optional[A.Compose] = None,
+    ):
+        self.csv_path = csv_path
+        self.transform = transform
+        self.image_paths = []
+        self.labels = []
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header:
+                try:
+                    self.labels.append(int(header[1]))
+                    self.image_paths.append(header[0])
+                except ValueError:
+                    pass  # Header row
+            
+            for row in reader:
+                if len(row) >= 2:
+                    self.image_paths.append(row[0])
+                    self.labels.append(int(row[1]))
+
+        logger.info(
+            f"Loaded CSV split from {csv_path}: "
+            f"{sum(1 for l in self.labels if l == 0)} real, "
+            f"{sum(1 for l in self.labels if l == 1)} fake, "
+            f"{len(self.labels)} total"
+        )
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+
+        # Load image
+        image = np.array(Image.open(img_path).convert("RGB"))
+
+        # Apply transforms
+        if self.transform:
+            augmented = self.transform(image=image)
+            image = augmented["image"]
+        else:
+            image = torch.from_numpy(image).permute(2, 0, 1).float() / 255.0
+
+        label_tensor = torch.tensor([label], dtype=torch.float32)
+
+        return image, label_tensor
+
+    def get_path(self, idx: int) -> str:
+        """Get the file path for a specific index."""
+        return self.image_paths[idx]
+
+
 def create_dataloaders(cfg: Config) -> dict[str, DataLoader]:
     """
     Create train, validation, and test DataLoaders.
@@ -166,11 +232,22 @@ def create_dataloaders(cfg: Config) -> dict[str, DataLoader]:
     train_transform = get_train_transforms(cfg)
     val_transform = get_val_transforms(cfg)
 
-    datasets = {
-        "train": DeepfakeDataset(cfg.frames_dir, "train", train_transform),
-        "val": DeepfakeDataset(cfg.frames_dir, "val", val_transform),
-        "test": DeepfakeDataset(cfg.frames_dir, "test", val_transform),
-    }
+    datasets = {}
+    
+    if hasattr(cfg, 'train_csv') and cfg.train_csv:
+        datasets["train"] = CSVDataset(cfg.train_csv, train_transform)
+    else:
+        datasets["train"] = DeepfakeDataset(cfg.frames_dir, "train", train_transform)
+        
+    if hasattr(cfg, 'val_csv') and cfg.val_csv:
+        datasets["val"] = CSVDataset(cfg.val_csv, val_transform)
+    else:
+        datasets["val"] = DeepfakeDataset(cfg.frames_dir, "val", val_transform)
+        
+    if hasattr(cfg, 'test_csv') and cfg.test_csv:
+        datasets["test"] = CSVDataset(cfg.test_csv, val_transform)
+    else:
+        datasets["test"] = DeepfakeDataset(cfg.frames_dir, "test", val_transform)
 
     loaders = {}
     for split, ds in datasets.items():
