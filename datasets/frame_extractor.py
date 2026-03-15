@@ -95,6 +95,29 @@ def _extract_worker(args: tuple) -> list[str]:
     return extract_frames_from_video(video_path, output_dir, timestamps, frame_format)
 
 
+def _find_videos_robustly(base_dir: str, compression: str) -> list[str]:
+    """Finds videos handling both official and flattened Kaggle structures."""
+    # 1. Official: base_dir/compression/videos/*.mp4
+    strict_dir = os.path.join(base_dir, compression, "videos")
+    if os.path.isdir(strict_dir):
+        vids = sorted(glob.glob(os.path.join(strict_dir, "*.mp4")))
+        if vids:
+            return vids
+
+    # 2. Kaggle flattened 1: base_dir/compression/*.mp4
+    comp_dir = os.path.join(base_dir, compression)
+    if os.path.isdir(comp_dir):
+        vids = sorted(glob.glob(os.path.join(comp_dir, "*.mp4")))
+        if vids:
+            return vids
+
+    # 3. Kaggle flattened 2: Recursive fallback
+    if os.path.isdir(base_dir):
+        return sorted(glob.glob(os.path.join(base_dir, "**", "*.mp4"), recursive=True))
+
+    return []
+
+
 def extract_ffpp_frames(
     ffpp_root: str,
     output_root: str,
@@ -120,40 +143,32 @@ def extract_ffpp_frames(
     logger.info(f"Extracting FF++ frames from: {ffpp_root}")
 
     # --- Real videos ---
-    real_video_dir = os.path.join(
-        ffpp_root, "original_sequences", "youtube", compression, "videos"
-    )
+    real_video_base = os.path.join(ffpp_root, "original_sequences", "youtube")
+    real_vids = _find_videos_robustly(real_video_base, compression)
     real_output = os.path.join(output_root, "real")
+    
+    tasks = []
+    if real_vids:
+        for vp in real_vids:
+            tasks.append((vp, real_output, timestamps, "png"))
+        logger.info(f"  Real videos found: {len(tasks)}")
+    else:
+        logger.warning(f"  Real videos not found in: {real_video_base}")
 
     # --- Fake videos (all manipulation methods) ---
     manipulation_methods = [
         "Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"
     ]
-    fake_video_dirs = []
-    for method in manipulation_methods:
-        d = os.path.join(
-            ffpp_root, "manipulated_sequences", method, compression, "videos"
-        )
-        if os.path.isdir(d):
-            fake_video_dirs.append(d)
-
-    # Collect all video paths
-    tasks = []
-
-    if os.path.isdir(real_video_dir):
-        for vp in sorted(glob.glob(os.path.join(real_video_dir, "*.mp4"))):
-            tasks.append((vp, real_output, timestamps, "png"))
-        logger.info(f"  Real videos found: {len(tasks)}")
-    else:
-        logger.warning(f"  Real video dir not found: {real_video_dir}")
-
-    fake_count = 0
     fake_output = os.path.join(output_root, "fake")
-    for d in fake_video_dirs:
-        vids = sorted(glob.glob(os.path.join(d, "*.mp4")))
-        for vp in vids:
+    fake_count = 0
+    
+    for method in manipulation_methods:
+        fake_base = os.path.join(ffpp_root, "manipulated_sequences", method)
+        fake_vids = _find_videos_robustly(fake_base, compression)
+        for vp in fake_vids:
             tasks.append((vp, fake_output, timestamps, "png"))
-        fake_count += len(vids)
+        fake_count += len(fake_vids)
+        
     logger.info(f"  Fake videos found: {fake_count}")
 
     # Extract with multiprocessing
@@ -264,17 +279,15 @@ def build_split_structure(
             split_output = os.path.join(output_root, split_name)
 
             # Extract real videos for this split
-            real_video_dir = os.path.join(
-                ffpp_root, "original_sequences", "youtube", compression, "videos"
-            )
+            real_video_base = os.path.join(ffpp_root, "original_sequences", "youtube")
+            real_vids = _find_videos_robustly(real_video_base, compression)
             real_output = os.path.join(split_output, "real")
             tasks = []
 
-            if os.path.isdir(real_video_dir):
-                for vid_id in video_ids:
-                    vp = os.path.join(real_video_dir, f"{vid_id}.mp4")
-                    if os.path.isfile(vp):
-                        tasks.append((vp, real_output, timestamps, "png"))
+            for vid_path in real_vids:
+                vid_name = Path(vid_path).stem
+                if vid_name in video_ids:
+                    tasks.append((vid_path, real_output, timestamps, "png"))
 
             # Extract fake videos for this split
             manipulation_methods = [
@@ -282,17 +295,14 @@ def build_split_structure(
             ]
             fake_output = os.path.join(split_output, "fake")
             for method in manipulation_methods:
-                fake_dir = os.path.join(
-                    ffpp_root, "manipulated_sequences", method,
-                    compression, "videos"
-                )
-                if os.path.isdir(fake_dir):
-                    for vid in sorted(glob.glob(os.path.join(fake_dir, "*.mp4"))):
-                        # Check if the source video ID is in this split
-                        vid_name = Path(vid).stem
-                        source_id = vid_name.split("_")[0]
-                        if source_id in video_ids:
-                            tasks.append((vp, fake_output, timestamps, "png"))
+                fake_base = os.path.join(ffpp_root, "manipulated_sequences", method)
+                fake_vids = _find_videos_robustly(fake_base, compression)
+                
+                for vid_path in fake_vids:
+                    vid_name = Path(vid_path).stem
+                    source_id = vid_name.split("_")[0]
+                    if source_id in video_ids:
+                        tasks.append((vid_path, fake_output, timestamps, "png"))
 
             logger.info(f"  {split_name}: {len(tasks)} videos to extract")
             with Pool(num_workers) as pool:
