@@ -10,6 +10,7 @@ import os
 import cv2
 import glob
 import argparse
+import csv
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
@@ -95,27 +96,93 @@ def _extract_worker(args: tuple) -> list[str]:
     return extract_frames_from_video(video_path, output_dir, timestamps, frame_format)
 
 
-def _find_videos_robustly(base_dir: str, compression: str) -> list[str]:
-    """Finds videos handling both official and flattened Kaggle structures."""
-    # 1. Official: base_dir/compression/videos/*.mp4
-    strict_dir = os.path.join(base_dir, compression, "videos")
-    if os.path.isdir(strict_dir):
-        vids = sorted(glob.glob(os.path.join(strict_dir, "*.mp4")))
-        if vids:
-            return vids
+def _get_ffpp_video_paths(ffpp_root: str, compression: str, metadata_csv: str = "") -> tuple[list[str], list[str]]:
+    """
+    Robustly finds real and fake videos in FF++ dataset, handling official
+    nested structure, flat structures, Kaggle variations, and explicit CSV metadata.
+    """
+    real_vids = []
+    fake_vids = []
+    
+    # --- 0. Metadata CSV Parsing ---
+    if metadata_csv and os.path.isfile(metadata_csv):
+        logger.info(f"Parsing explicit metadata CSV: {metadata_csv}")
+        # Build lookup table of basenames from directory
+        all_mp4s = glob.glob(os.path.join(ffpp_root, "**", "*.mp4"), recursive=True)
+        vid_map = {os.path.basename(p): p for p in all_mp4s}
+        
+        found_real, found_fake = 0, 0
+        with open(metadata_csv, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # E.g. File Path: DeepFakeDetection/01_02__meeting_serious__YVGY8LOK.mp4
+                if 'File Path' not in row or 'Label' not in row:
+                    logger.warning("CSV must contain 'File Path' and 'Label' columns.")
+                    break
+                    
+                fp = row['File Path']
+                label = row['Label'].strip().upper()
+                basename = os.path.basename(fp)
+                
+                if basename in vid_map:
+                    if label == "FAKE":
+                        fake_vids.append(vid_map[basename])
+                        found_fake += 1
+                    elif label == "REAL":
+                        real_vids.append(vid_map[basename])
+                        found_real += 1
+                        
+        if real_vids or fake_vids:
+            logger.info(f"Resolved from CSV: {found_real} real, {found_fake} fake")
+            return sorted(list(set(real_vids))), sorted(list(set(fake_vids)))
+        else:
+            logger.warning("Failed to resolve any videos from CSV, falling back to path heuristics.")
+            
+    # --- Fallback Heuristics ---
+    def _find(bd):
+        vids = []
+        if not os.path.isdir(bd): return vids
+        sd = os.path.join(bd, compression, "videos")
+        if os.path.isdir(sd):
+            vids.extend(glob.glob(os.path.join(sd, "*.mp4")))
+            if vids: return vids
+        cd = os.path.join(bd, compression)
+        if os.path.isdir(cd):
+            vids.extend(glob.glob(os.path.join(cd, "*.mp4")))
+            if vids: return vids
+        return glob.glob(os.path.join(bd, "**", "*.mp4"), recursive=True)
 
-    # 2. Kaggle flattened 1: base_dir/compression/*.mp4
-    comp_dir = os.path.join(base_dir, compression)
-    if os.path.isdir(comp_dir):
-        vids = sorted(glob.glob(os.path.join(comp_dir, "*.mp4")))
-        if vids:
-            return vids
+    # 1. Official paths
+    off_real = os.path.join(ffpp_root, "original_sequences", "youtube")
+    if os.path.isdir(off_real):
+        real_vids.extend(_find(off_real))
+        for m in ["Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"]:
+            fake_vids.extend(_find(os.path.join(ffpp_root, "manipulated_sequences", m)))
+        if real_vids or fake_vids:
+            return sorted(list(set(real_vids))), sorted(list(set(fake_vids)))
 
-    # 3. Kaggle flattened 2: Recursive fallback
-    if os.path.isdir(base_dir):
-        return sorted(glob.glob(os.path.join(base_dir, "**", "*.mp4"), recursive=True))
+    # 2. Flattened paths
+    for rd in ["youtube", "real", "original"]:
+        d = os.path.join(ffpp_root, rd)
+        if os.path.isdir(d): real_vids.extend(_find(d))
+        
+    for fd in ["Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures", "fake", "manipulated"]:
+        d = os.path.join(ffpp_root, fd)
+        if os.path.isdir(d): fake_vids.extend(_find(d))
+        
+    if real_vids or fake_vids:
+        return sorted(list(set(real_vids))), sorted(list(set(fake_vids)))
 
-    return []
+    # 3. Ultimate Fallback
+    all_mp4s = glob.glob(os.path.join(ffpp_root, "**", "*.mp4"), recursive=True)
+    for vp in all_mp4s:
+        p_low = vp.lower()
+        if any(k in p_low for k in ["deepfake", "face2face", "faceswap", "neuraltexture", "manipulate", "fake"]):
+            fake_vids.append(vp)
+        elif any(k in p_low for k in ["youtube", "original", "real"]):
+            real_vids.append(vp)
+            
+    return sorted(list(set(real_vids))), sorted(list(set(fake_vids)))
 
 
 def extract_ffpp_frames(
@@ -124,52 +191,34 @@ def extract_ffpp_frames(
     timestamps: list[float] = [0.5, 1.0, 1.5],
     compression: str = "c23",
     num_workers: int = 4,
+    metadata_csv: str = "",
 ):
     """
     Extract frames from FaceForensics++ dataset.
-
-    Expected FF++ structure:
-        ffpp_root/
-            original_sequences/youtube/c23/videos/
-            manipulated_sequences/{method}/c23/videos/
-
-    Args:
-        ffpp_root: Root directory of FaceForensics++.
-        output_root: Output directory for extracted frames.
-        timestamps: Timestamps to extract.
-        compression: Compression level (c23, c40, raw).
-        num_workers: Number of parallel workers.
     """
     logger.info(f"Extracting FF++ frames from: {ffpp_root}")
 
-    # --- Real videos ---
-    real_video_base = os.path.join(ffpp_root, "original_sequences", "youtube")
-    real_vids = _find_videos_robustly(real_video_base, compression)
-    real_output = os.path.join(output_root, "real")
+    real_vids, fake_vids = _get_ffpp_video_paths(ffpp_root, compression, metadata_csv)
     
     tasks = []
+    
+    # --- Real videos ---
+    real_output = os.path.join(output_root, "real")
     if real_vids:
         for vp in real_vids:
             tasks.append((vp, real_output, timestamps, "png"))
-        logger.info(f"  Real videos found: {len(tasks)}")
+        logger.info(f"  Real videos found: {len(real_vids)}")
     else:
-        logger.warning(f"  Real videos not found in: {real_video_base}")
+        logger.warning(f"  Real videos not found in {ffpp_root}")
 
-    # --- Fake videos (all manipulation methods) ---
-    manipulation_methods = [
-        "Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"
-    ]
+    # --- Fake videos ---
     fake_output = os.path.join(output_root, "fake")
-    fake_count = 0
-    
-    for method in manipulation_methods:
-        fake_base = os.path.join(ffpp_root, "manipulated_sequences", method)
-        fake_vids = _find_videos_robustly(fake_base, compression)
+    if fake_vids:
         for vp in fake_vids:
             tasks.append((vp, fake_output, timestamps, "png"))
-        fake_count += len(fake_vids)
-        
-    logger.info(f"  Fake videos found: {fake_count}")
+        logger.info(f"  Fake videos found: {len(fake_vids)}")
+    else:
+        logger.warning(f"  Fake videos not found in {ffpp_root}")
 
     # Extract with multiprocessing
     logger.info(f"  Extracting frames with {num_workers} workers...")
@@ -238,6 +287,7 @@ def build_split_structure(
     timestamps: list[float] = [0.5, 1.0, 1.5],
     compression: str = "c23",
     num_workers: int = 4,
+    metadata_csv: str = "",
 ):
     """
     Build the train/val/test split structure using FaceForensics++ official splits.
@@ -251,6 +301,7 @@ def build_split_structure(
         timestamps: Frame extraction timestamps.
         compression: Compression level.
         num_workers: Number of workers.
+        metadata_csv: Optional metadata CSV mapping file.
     """
     splits_dir = os.path.join(ffpp_root, "splits")
 
@@ -278,10 +329,11 @@ def build_split_structure(
 
             split_output = os.path.join(output_root, split_name)
 
-            # Extract real videos for this split
-            real_video_base = os.path.join(ffpp_root, "original_sequences", "youtube")
-            real_vids = _find_videos_robustly(real_video_base, compression)
+            # Extract videos for this split
+            real_vids, fake_vids = _get_ffpp_video_paths(ffpp_root, compression, metadata_csv)
+            
             real_output = os.path.join(split_output, "real")
+            fake_output = os.path.join(split_output, "fake")
             tasks = []
 
             for vid_path in real_vids:
@@ -289,20 +341,11 @@ def build_split_structure(
                 if vid_name in video_ids:
                     tasks.append((vid_path, real_output, timestamps, "png"))
 
-            # Extract fake videos for this split
-            manipulation_methods = [
-                "Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"
-            ]
-            fake_output = os.path.join(split_output, "fake")
-            for method in manipulation_methods:
-                fake_base = os.path.join(ffpp_root, "manipulated_sequences", method)
-                fake_vids = _find_videos_robustly(fake_base, compression)
-                
-                for vid_path in fake_vids:
-                    vid_name = Path(vid_path).stem
-                    source_id = vid_name.split("_")[0]
-                    if source_id in video_ids:
-                        tasks.append((vid_path, fake_output, timestamps, "png"))
+            for vid_path in fake_vids:
+                vid_name = Path(vid_path).stem
+                source_id = vid_name.split("_")[0]
+                if source_id in video_ids:
+                    tasks.append((vid_path, fake_output, timestamps, "png"))
 
             logger.info(f"  {split_name}: {len(tasks)} videos to extract")
             with Pool(num_workers) as pool:
@@ -316,7 +359,7 @@ def build_split_structure(
         # User can manually create splits afterward
         logger.info("No official split files found, extracting all frames to flat structure")
         logger.info("You can create train/val/test splits manually later")
-        extract_ffpp_frames(ffpp_root, output_root, timestamps, compression, num_workers)
+        extract_ffpp_frames(ffpp_root, output_root, timestamps, compression, num_workers, metadata_csv)
 
 
 if __name__ == "__main__":
@@ -327,6 +370,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, required=True, help="Output directory for frames")
     parser.add_argument("--compression", type=str, default="c23", choices=["c23", "c40", "raw"])
     parser.add_argument("--workers", type=int, default=cpu_count())
+    parser.add_argument("--metadata_csv", type=str, default="", help="Optional Kaggle CSV metadata")
     parser.add_argument(
         "--timestamps",
         type=float,
@@ -338,7 +382,7 @@ if __name__ == "__main__":
     if args.dataset in ("ffpp", "both"):
         assert args.ffpp_root, "Must provide --ffpp_root for FF++ extraction"
         build_split_structure(
-            args.ffpp_root, args.output, args.timestamps, args.compression, args.workers
+            args.ffpp_root, args.output, args.timestamps, args.compression, args.workers, args.metadata_csv
         )
 
     if args.dataset in ("celebdf", "both"):

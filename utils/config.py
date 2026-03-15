@@ -27,6 +27,9 @@ class Config:
     # ── Dataset Sources (user must set these) ──────────────────────────
     ffpp_root: str = ""          # Path to FaceForensics++ root
     celebdf_root: str = ""       # Path to Celeb-DF v2 root
+    train_csv: str = ""          # Path to CSV for training data
+    val_csv: str = ""            # Path to CSV for validation data
+    test_csv: str = ""           # Path to CSV for test data
 
     # ── Frame Extraction ───────────────────────────────────────────────
     frame_timestamps: list = field(default_factory=lambda: [0.5, 1.0, 1.5])
